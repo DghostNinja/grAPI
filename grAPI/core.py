@@ -1,9 +1,13 @@
 import asyncio
 import json
+import os
 import re
+import subprocess
 import sys
 import threading
+import urllib.request
 import uuid
+from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
 
 GREEN = "\033[92m"
@@ -16,6 +20,45 @@ COLORS = {
     "OTHER": "\033[0m",
 }
 
+HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+METHOD_ORDER = {m: i for i, m in enumerate(("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"))}
+
+
+class MissingBrowserError(RuntimeError):
+    """Raised when the Playwright browser binary has not been downloaded."""
+
+
+BROWSER_HELP = """\
+[!] The Playwright browser (Chromium) is not installed for this environment.
+    Fix it by downloading it through grapi itself:
+
+        grapi --install-browsers
+
+    or, equivalently, with the same Python that runs grapi:
+
+        {python} -m playwright install chromium
+
+    Note: the Debian/Ubuntu package `node-playwright` is a different tool and
+    does not provide these browsers (it fails with "onExit is not a function").
+"""
+
+
+def install_browsers() -> int:
+    """Download the Chromium build Playwright needs, using this interpreter."""
+    print(f"[*] Downloading the Playwright Chromium browser for {sys.executable} ...")
+    try:
+        result = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"])
+    except OSError as exc:
+        sys.stdout.write(f"[!] Could not run playwright installer ({exc}).\n")
+        return 1
+    if result.returncode == 0:
+        print("[+] Browser installed. grapi is ready to use.")
+    else:
+        print("[!] Browser installation failed. See the output above for details.")
+        print("    If shared libraries are missing, install the system packages "
+              "listed in the README (Required Libraries section) and re-run.")
+    return result.returncode
+
 BANNER = f"""{GREEN}
             _   ___ ___ 
   __ _ _ _ /_\\ | _ \\_ _|
@@ -25,12 +68,91 @@ BANNER = f"""{GREEN}
 {RESET}
 """
 
+# Files that are never API endpoints (fonts, images, styles, scripts, media).
+STATIC_ASSET_RE = re.compile(
+    r"\.(?:woff2?|ttf|otf|eot|css|js|mjs|cjs|map|png|jpe?g|gif|svg|webp|avif|ico|"
+    r"mp4|webm|ogv|mp3|wav|ogg|wasm)$",
+    re.IGNORECASE,
+)
+
+PATH_RE = re.compile(r"(https?://[^\s'\"<>]+|/[A-Za-z0-9_\-/.{}]+)")
+
+# Infrastructure endpoints (e.g. Cloudflare telemetry) that are not app APIs.
+IGNORED_PATHS = ("/cdn-cgi/",)
+
+# Request call sites in JavaScript: the path of a fetch/XHR/axios call is an
+# API endpoint by definition, even when it carries no /api/ style keyword.
+FETCH_CALL_RE = re.compile(
+    r"""\bfetch\s*\(\s*['"](?P<url>[^'"]+)['"]\s*(?:,\s*\{(?P<opts>[^}]{0,400})\})?""",
+    re.I | re.S,
+)
+AXIOS_CALL_RE = re.compile(
+    r"""\baxios\s*\.\s*(?P<method>get|post|put|patch|delete|head|options)\s*\(\s*['"](?P<url>[^'"]+)['"]""",
+    re.I,
+)
+XHR_OPEN_RE = re.compile(
+    r"""\.open\s*\(\s*['"](?P<method>[A-Za-z]+)['"]\s*,\s*['"](?P<url>[^'"]+)['"]"""
+)
+AJAX_CALL_RE = re.compile(r"""\$\.ajax\s*\(\s*\{(?P<opts>.*?)\}\s*\)""", re.I | re.S)
+METHOD_RE = re.compile(r"""\b(?:type|method)\s*:\s*['"](\w+)['"]""", re.I)
+AJAX_URL_RE = re.compile(r"""\burl\s*:\s*['"]([^'"]+)['"]""", re.I)
+
+
 def is_potential_api(url: str) -> bool:
     lowered = url.lower()
     return any(
         keyword in lowered
         for keyword in ["/api/", "/graphql", "/openapi", "/user", "/swagger", ".json"]
     ) or bool(re.search(r"/v[0-9]+(?:/|$)", lowered))
+
+
+def is_static_asset(url: str) -> bool:
+    return bool(STATIC_ASSET_RE.search(urlparse(url).path))
+
+
+def is_ignored_path(url: str) -> bool:
+    path = urlparse(url).path
+    return any(marker in path for marker in IGNORED_PATHS)
+
+
+def is_api_request(url: str, resource_type: str = "", same_origin: bool = True) -> bool:
+    """Decide whether a live request should be reported as an API endpoint.
+
+    Same-origin XHR/fetch traffic is always reported (no keyword guessing),
+    static assets and infrastructure beacons never are, and cross-origin
+    traffic still has to look like an API to avoid CDN/analytics noise.
+    """
+    if is_static_asset(url) or is_ignored_path(url):
+        return False
+    if same_origin and resource_type in ("xhr", "fetch"):
+        return True
+    return is_potential_api(url)
+
+
+def extract_script_calls(text: str) -> dict:
+    """Return {path: METHOD} for fetch/axios/XHR/ajax call sites in JS text."""
+    calls = {}
+    for match in FETCH_CALL_RE.finditer(text):
+        method = "GET"
+        options = match.group("opts") or ""
+        found = METHOD_RE.search(options)
+        if found:
+            method = found.group(1).upper()
+        calls.setdefault(match.group("url"), method)
+    for match in AXIOS_CALL_RE.finditer(text):
+        calls.setdefault(match.group("url"), match.group("method").upper())
+    for match in XHR_OPEN_RE.finditer(text):
+        method = match.group("method").upper()
+        calls.setdefault(match.group("url"), method if method in HTTP_METHODS else "GET")
+    for match in AJAX_CALL_RE.finditer(text):
+        options = match.group("opts") or ""
+        url = AJAX_URL_RE.search(options)
+        if not url:
+            continue
+        found = METHOD_RE.search(options)
+        calls.setdefault(url.group(1), (found.group(1) if found else "GET").upper())
+    return calls
+
 
 def save_output(endpoints, filename):
     if filename.endswith(".json"):
@@ -41,58 +163,187 @@ def save_output(endpoints, filename):
             f.write("\n".join(sorted(endpoints)))
     print(f"[+] Saved {len(endpoints)} endpoints to {filename}")
 
+
+def _methods_for(endpoints, url):
+    if isinstance(endpoints, dict):
+        methods = endpoints.get(url) or set()
+        return {m.upper() for m in methods if m} or {"GET"}
+    return {"GET"}
+
+
 def generate_postman_collection(endpoints, filename):
+    items = []
+    for url in sorted(endpoints):
+        methods = sorted(
+            _methods_for(endpoints, url),
+            key=lambda m: METHOD_ORDER.get(m, len(METHOD_ORDER)),
+        )
+        postman_url = re.sub(r"\{([^}]+)\}", r":\1", url)
+        for method in methods:
+            items.append(
+                {
+                    "name": f"{method} {url}",
+                    "request": {
+                        "method": method,
+                        "header": [],
+                        "url": {"raw": postman_url},
+                    },
+                    "response": [],
+                }
+            )
     collection = {
         "info": {
             "name": "Extracted API Endpoints",
             "_postman_id": str(uuid.uuid4()),
             "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
         },
-        "item": [
-            {
-                "name": path,
-                "request": {"method": "GET", "header": [], "url": {"raw": path}},
-                "response": [],
-            }
-            for path in sorted(endpoints)
-        ],
+        "item": items,
     }
     with open(filename, "w") as f:
         json.dump(collection, f, indent=2)
     print(f"[+] Saved Postman collection to {filename}")
 
-async def scan_js_files(page):
-    js_urls = await page.evaluate(
-        "() => Array.from(document.querySelectorAll('script[src]')).map(s => s.src)"
+
+def _fetch_json(url, timeout=20):
+    request = urllib.request.Request(url, headers={"User-Agent": "grAPI"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def load_openapi_spec(spec_url, base_url, timeout=20):
+    """Pull endpoints out of an OpenAPI/Swagger document.
+
+    Returns {url: {METHOD, ...}} with relative paths resolved against the
+    target site origin. Paths with parameters keep their {param} form.
+    """
+    try:
+        spec = _fetch_json(spec_url, timeout=timeout)
+    except Exception as exc:
+        sys.stdout.write(f"[!] Could not load spec from {spec_url} ({exc})\n")
+        sys.stdout.flush()
+        return {}
+
+    paths = spec.get("paths") or {}
+    base = "{0.scheme}://{0.netloc}/".format(urlparse(base_url))
+    endpoints = {}
+    for path, operations in paths.items():
+        if not isinstance(operations, dict) or not isinstance(path, str):
+            continue
+        url = urljoin(base, path)
+        for method in operations:
+            method = method.upper()
+            if method not in HTTP_METHODS:
+                continue
+            endpoints.setdefault(url, set()).add(method)
+    for url in sorted(endpoints):
+        for method in sorted(endpoints[url]):
+            color = COLORS.get(method, COLORS["OTHER"])
+            sys.stdout.write(f"{color}[spec] {method}: {url}{RESET}\n")
+    sys.stdout.flush()
+    return endpoints
+
+
+async def scan_scripts(page):
+    """Scan inline page scripts and external JS files.
+
+    Returns {"keyword": set of API-looking paths, "calls": {path: METHOD}}.
+    """
+    scripts = await page.evaluate(
+        """() => ({
+            external: Array.from(document.querySelectorAll('script[src]')).map(s => s.src),
+            inline: Array.from(document.querySelectorAll('script:not([src])'))
+                       .map(s => s.textContent || '')
+        })"""
     )
-    potential = set()
-    for js_url in js_urls:
+    keyword_paths = set()
+    call_paths = {}
+
+    def scan_text(text):
+        for match in PATH_RE.findall(text):
+            if is_potential_api(match):
+                keyword_paths.add(match)
+        for path, method in extract_script_calls(text).items():
+            call_paths.setdefault(path, method)
+
+    for text in scripts.get("inline", []):
+        scan_text(text)
+    for js_url in scripts.get("external", []):
         try:
             content = await (await page.request.get(js_url)).text()
-            matches = re.findall(r"(https?://[^\s'\"<>]+|/[A-Za-z0-9_\\-/.]+)", content)
-            for match in matches:
-                if is_potential_api(match):
-                    potential.add(match)
-        except:
+        except Exception:
             continue
-    return potential
+        scan_text(content)
+    return {"keyword": keyword_paths, "calls": call_paths}
 
-async def intercept_apis(target_url, timeout, auto_scroll=False):
-    apis = set()
+
+async def scan_js_files(page):
+    """Backwards-compatible wrapper: every API path found in page scripts."""
+    data = await scan_scripts(page)
+    return set(data["keyword"]) | set(data["calls"])
+
+
+async def intercept_apis(
+    target_url,
+    timeout,
+    auto_scroll=False,
+    headless=False,
+    duration=None,
+    extra_endpoints=None,
+):
+    apis = {}
+    seen = set()
     stop_event = threading.Event()
+    target_host = urlparse(target_url).netloc
+
+    def add_endpoint(url, method, label="API detected"):
+        key = (method, url)
+        if key in seen:
+            return False
+        seen.add(key)
+        apis.setdefault(url, set()).add(method)
+        color = COLORS.get(method, COLORS["OTHER"])
+        sys.stdout.write(f"{color}[{label}] {method}: {url}{RESET}\n")
+        sys.stdout.flush()
+        return True
+
+    def record_js_path(url):
+        if url in apis:
+            return
+        same_origin = not urlparse(url).netloc or urlparse(url).netloc == target_host
+        if is_api_request(url, resource_type="", same_origin=same_origin):
+            add_endpoint(url, "GET", label="JS-detected")
+
+    def record_script_call(url, method):
+        absolute = urljoin(target_url, url)
+        if absolute in apis or is_static_asset(absolute) or is_ignored_path(absolute):
+            return
+        host = urlparse(absolute).netloc
+        if host and host != target_host and not is_potential_api(absolute):
+            return
+        if method not in HTTP_METHODS:
+            method = "GET"
+        add_endpoint(absolute, method, label="JS-detected")
+
+    for url, methods in (extra_endpoints or {}).items():
+        apis.setdefault(url, set()).update(methods)
+        seen.update((m, url) for m in methods)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        try:
+            browser = await p.chromium.launch(headless=headless)
+        except Exception as exc:
+            if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc):
+                raise MissingBrowserError(
+                    BROWSER_HELP.format(python=sys.executable)
+                ) from exc
+            raise
         context = await browser.new_context()
 
         def handle_request(request):
             url = request.url
-            method = request.method.upper()
-            color = COLORS.get(method, COLORS["OTHER"])
-            if is_potential_api(url) and url not in apis:
-                apis.add(url)
-                sys.stdout.write(f"{color}[API detected] {method}: {url}{RESET}\n")
-                sys.stdout.flush()
+            same_origin = urlparse(url).netloc == target_host
+            if is_api_request(url, request.resource_type, same_origin):
+                add_endpoint(url, request.method.upper())
 
         context.on("request", handle_request)
         page = await context.new_page()
@@ -100,10 +351,21 @@ async def intercept_apis(target_url, timeout, auto_scroll=False):
         def wait_for_user():
             sys.stdout.write("[*] Interactive mode — hit ENTER in terminal when you’re finished\n")
             sys.stdout.flush()
-            input()
+            try:
+                input()
+            except EOFError:
+                if duration is None:
+                    sys.stdout.write("[*] stdin closed — stopping capture.\n")
+                    sys.stdout.flush()
+                return
             stop_event.set()
 
         threading.Thread(target=wait_for_user, daemon=True).start()
+
+        if duration:
+            sys.stdout.write(f"[*] Auto-stop in {duration}s.\n")
+            sys.stdout.flush()
+            threading.Timer(duration, stop_event.set).start()
 
         sys.stdout.write(f"[*] Visiting {target_url}. Interact manually.\n")
         sys.stdout.flush()
@@ -121,15 +383,22 @@ async def intercept_apis(target_url, timeout, auto_scroll=False):
             for _ in range(10):
                 if stop_event.is_set():
                     break
-                await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
+                try:
+                    await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
+                except Exception:
+                    break
                 await asyncio.sleep(1)
 
-        js_apis = await scan_js_files(page)
-        for api in js_apis:
-            if api not in apis:
-                apis.add(api)
-                sys.stdout.write(f"{COLORS['OTHER']}[JS-detected] {api}{RESET}\n")
-                sys.stdout.flush()
+        try:
+            scripts = await scan_scripts(page)
+        except Exception as exc:
+            sys.stdout.write(f"[!] Could not scan page scripts ({exc}), continuing...\n")
+            sys.stdout.flush()
+            scripts = {"keyword": set(), "calls": {}}
+        for path, method in scripts["calls"].items():
+            record_script_call(path, method)
+        for path in scripts["keyword"]:
+            record_js_path(urljoin(target_url, path))
 
         while not stop_event.is_set():
             await asyncio.sleep(0.2)
