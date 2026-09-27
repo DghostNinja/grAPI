@@ -260,6 +260,7 @@ Find your error message below, then run the command shown under it.
 | `error while loading shared libraries: lib....so` | [5](#5-missing-shared-libraries) |
 | Nothing happens / no browser window appears | [6](#6-no-browser-window) |
 | The scan seems to hang after loading the page | [7](#7-scan-seems-to-hang) |
+| Page layout is cut off / ignores the window size | [8](#8-page-layout-cut-off) |
 
 #### 1. No module named playwright
 
@@ -349,6 +350,22 @@ That's normal: grAPI is waiting for you to browse the page. Stop it by pressing
 grapi --url https://targetsite.com --duration 30
 ```
 
+#### 8. Page layout cut off
+
+Older grAPI builds pinned the page to a fixed 1280x720 viewport, so maximizing the
+window did nothing and content stayed cut off. Update to the current version:
+
+```bash
+pipx install --force .        # inside your grAPI folder (or: pip install . in your venv)
+```
+
+Then the window resizes normally, or start it at the size you want:
+
+```bash
+grapi --url https://targetsite.com --maximized
+grapi --url https://targetsite.com --window-size 1920x1080
+```
+
 ---
 
 ## Usage
@@ -367,6 +384,15 @@ This will:
 3. Save them into a file (`apis.txt`) and a Postman collection (`apis.postman.json`).
 
 When you’re done exploring the app, hit **Enter** in your terminal to stop the scan.
+
+The browser window is fully resizable: maximize it, restore it, or drag it to another
+monitor and the page reflows to match (grAPI does not force a fixed 1280x720 viewport,
+so nothing gets cut off). You can also pick a size up front:
+
+```bash
+grapi --url https://targetsite.com --window-size 1920x1080   # specific size
+grapi --url https://targetsite.com --maximized               # start maximized
+```
 
 Prefer to run it from the script instead of the installed command? This works too
 (only inside the project folder, and only if grAPI's dependencies are installed for
@@ -399,6 +425,8 @@ grapi --url https://vulnbank.org/ --spec https://vulnbank.org/static/openapi.jso
 | `--timeout` | Page load timeout in seconds. `0` disables timeout                           |
 | `--scroll`  | Automatically scrolls the page to trigger more API calls                     |
 | `--headless`| Run the browser without a visible window                                     |
+| `--window-size` | Browser window size as `WxH` (default `1440x900`). In headless mode it sets the page viewport. |
+| `--maximized`| Start the browser window maximized (windowed mode only)                     |
 | `--duration`| Stop automatically after N seconds instead of waiting for ENTER              |
 | `--spec`    | OpenAPI/Swagger JSON URL; its endpoints are merged with the captured ones    |
 | `--install-browsers` | One-time setup: download the Chromium browser, then exit (no `--url` needed) |

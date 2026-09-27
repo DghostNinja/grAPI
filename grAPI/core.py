@@ -22,6 +22,7 @@ COLORS = {
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 METHOD_ORDER = {m: i for i, m in enumerate(("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"))}
+DEFAULT_WINDOW_SIZE = (1440, 900)
 
 
 class MissingBrowserError(RuntimeError):
@@ -289,7 +290,10 @@ async def intercept_apis(
     headless=False,
     duration=None,
     extra_endpoints=None,
+    window_size=None,
+    maximized=False,
 ):
+    width, height = window_size or DEFAULT_WINDOW_SIZE
     apis = {}
     seen = set()
     stop_event = threading.Event()
@@ -329,15 +333,26 @@ async def intercept_apis(
         seen.update((m, url) for m in methods)
 
     async with async_playwright() as p:
+        launch_args = []
+        if maximized:
+            launch_args.append("--start-maximized")
+        else:
+            launch_args.append(f"--window-size={width},{height}")
         try:
-            browser = await p.chromium.launch(headless=headless)
+            browser = await p.chromium.launch(headless=headless, args=launch_args)
         except Exception as exc:
             if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc):
                 raise MissingBrowserError(
                     BROWSER_HELP.format(python=sys.executable)
                 ) from exc
             raise
-        context = await browser.new_context()
+        if headless:
+            # No window to resize: use the requested size as a fixed viewport.
+            context = await browser.new_context(viewport={"width": width, "height": height})
+        else:
+            # Let the page follow the real window size, so maximizing/resizing
+            # the browser reflows the layout instead of cutting content off.
+            context = await browser.new_context(no_viewport=True)
 
         def handle_request(request):
             url = request.url

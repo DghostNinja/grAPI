@@ -9,7 +9,25 @@ from grAPI.core import (
 )
 import argparse
 import asyncio
+import re
 import sys
+
+WINDOW_SIZE_RE = re.compile(r"^\s*(\d{3,5})\s*[xX,]\s*(\d{3,5})\s*$")
+
+
+def parse_window_size(value):
+    match = WINDOW_SIZE_RE.match(value)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"invalid window size '{value}' — expected WIDTHxHEIGHT, e.g. 1440x900"
+        )
+    width, height = int(match.group(1)), int(match.group(2))
+    if width < 200 or height < 200:
+        raise argparse.ArgumentTypeError(
+            f"window size {width}x{height} is too small — minimum is 200x200"
+        )
+    return (width, height)
+
 
 def main():
     print(BANNER)
@@ -40,6 +58,19 @@ def main():
         help="Stop automatically after N seconds (non-interactive mode).",
     )
     parser.add_argument(
+        "--window-size",
+        type=parse_window_size,
+        default="1440x900",
+        metavar="WxH",
+        help="Browser window size, e.g. 1440x900 (default: 1440x900). "
+        "In headless mode this sets the page viewport instead.",
+    )
+    parser.add_argument(
+        "--maximized",
+        action="store_true",
+        help="Start the browser window maximized (windowed mode only).",
+    )
+    parser.add_argument(
         "--spec",
         help="OpenAPI/Swagger JSON URL to import known endpoints from.",
     )
@@ -64,16 +95,18 @@ def main():
     extra_endpoints = load_openapi_spec(args.spec, args.url) if args.spec else {}
 
     try:
-        endpoints = asyncio.run(
-            intercept_apis(
-                args.url,
-                timeout=args.timeout,
-                auto_scroll=args.scroll,
-                headless=args.headless,
-                duration=args.duration,
-                extra_endpoints=extra_endpoints,
+            endpoints = asyncio.run(
+                intercept_apis(
+                    args.url,
+                    timeout=args.timeout,
+                    auto_scroll=args.scroll,
+                    headless=args.headless,
+                    duration=args.duration,
+                    extra_endpoints=extra_endpoints,
+                    window_size=args.window_size,
+                    maximized=args.maximized,
+                )
             )
-        )
     except MissingBrowserError as exc:
         sys.stdout.flush()
         sys.stderr.write(f"{exc}\n")
