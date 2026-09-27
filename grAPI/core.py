@@ -7,7 +7,7 @@ import sys
 import threading
 import urllib.request
 import uuid
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 from playwright.async_api import async_playwright
 
 GREEN = "\033[92m"
@@ -16,12 +16,21 @@ COLORS = {
     "GET": "\033[92m",
     "POST": "\033[93m",
     "PUT": "\033[94m",
+    "PATCH": "\033[96m",
     "DELETE": "\033[95m",
+    "HEAD": "\033[90m",
+    "OPTIONS": "\033[90m",
+    "TRACE": "\033[90m",
     "OTHER": "\033[0m",
 }
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 METHOD_ORDER = {m: i for i, m in enumerate(("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"))}
+# Operation keys allowed in an OpenAPI/Swagger `paths` object.
+SPEC_METHODS = frozenset(
+    ("get", "put", "post", "delete", "options", "head", "patch", "trace")
+)
+METHOD_TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9-]{1,19}$")
 DEFAULT_WINDOW_SIZE = (1440, 900)
 
 
@@ -78,25 +87,43 @@ STATIC_ASSET_RE = re.compile(
 
 PATH_RE = re.compile(r"(https?://[^\s'\"<>]+|/[A-Za-z0-9_\-/.{}]+)")
 
-# Infrastructure endpoints (e.g. Cloudflare telemetry) that are not app APIs.
-IGNORED_PATHS = ("/cdn-cgi/",)
+# Infrastructure endpoints (e.g. Cloudflare telemetry, PostHog analytics) that
+# are not application APIs, even when they sit on the target's own host.
+IGNORED_PATHS = (
+    "/cdn-cgi/",
+    "/i/v1/logs",
+    "/i/v1/metrics",
+    "/api/surveys/",
+    "/api/web_experiments/",
+    "/api/product_tours/",
+    "/api/early_access_features/",
+)
+
+# Hosts that are APIs by construction (api.example.com, gql.example.com, ...).
+API_HOST_RE = re.compile(r"^(?:api|api-v\d+|apis|gql|graphql|rest)[\w-]*\.", re.IGNORECASE)
+
+# GraphQL detection: content type, JSON body ({"query": ...}) or a raw body
+# that starts with an operation (query { ... }).
+GRAPHQL_JSON_KEY_RE = re.compile(r"""["'](query|mutation|subscription)["']\s*:""", re.I)
+GRAPHQL_RAW_START_RE = re.compile(r"""^\s*(?:query|mutation|subscription)\b""", re.I | re.S)
+GRAPHQL_URL_PARAMS = frozenset({"query", "mutation", "variables", "operationname"})
 
 # Request call sites in JavaScript: the path of a fetch/XHR/axios call is an
 # API endpoint by definition, even when it carries no /api/ style keyword.
 FETCH_CALL_RE = re.compile(
-    r"""\bfetch\s*\(\s*['"](?P<url>[^'"]+)['"]\s*(?:,\s*\{(?P<opts>[^}]{0,400})\})?""",
+    r"""\bfetch\s*\(\s*['"`](?P<url>[^'"`]+)['"`]\s*(?:,\s*\{(?P<opts>[^}]{0,400})\})?""",
     re.I | re.S,
 )
 AXIOS_CALL_RE = re.compile(
-    r"""\baxios\s*\.\s*(?P<method>get|post|put|patch|delete|head|options)\s*\(\s*['"](?P<url>[^'"]+)['"]""",
+    r"""\baxios\s*\.\s*(?P<method>get|post|put|patch|delete|head|options)\s*\(\s*['"`](?P<url>[^'"`]+)['"`]""",
     re.I,
 )
 XHR_OPEN_RE = re.compile(
-    r"""\.open\s*\(\s*['"](?P<method>[A-Za-z]+)['"]\s*,\s*['"](?P<url>[^'"]+)['"]"""
+    r"""\.open\s*\(\s*['"`](?P<method>[A-Za-z]+)['"`]\s*,\s*['"`](?P<url>[^'"`]+)['"`]"""
 )
 AJAX_CALL_RE = re.compile(r"""\$\.ajax\s*\(\s*\{(?P<opts>.*?)\}\s*\)""", re.I | re.S)
 METHOD_RE = re.compile(r"""\b(?:type|method)\s*:\s*['"](\w+)['"]""", re.I)
-AJAX_URL_RE = re.compile(r"""\burl\s*:\s*['"]([^'"]+)['"]""", re.I)
+AJAX_URL_RE = re.compile(r"""\burl\s*:\s*['"`]([^'"`]+)['"`]""", re.I)
 
 
 def is_potential_api(url: str) -> bool:
@@ -105,6 +132,22 @@ def is_potential_api(url: str) -> bool:
         keyword in lowered
         for keyword in ["/api/", "/graphql", "/openapi", "/user", "/swagger", ".json"]
     ) or bool(re.search(r"/v[0-9]+(?:/|$)", lowered))
+
+
+def normalize_method(method, default="GET"):
+    """Upper-case and validate an HTTP method token.
+
+    Accepts any verb-shaped token (GET, PATCH, QUERY, PROPFIND, ...) so methods
+    outside the usual GET/POST/PUT/DELETE set are recorded as they are.
+    """
+    if not method:
+        return default
+    token = str(method).strip().upper()
+    return token if METHOD_TOKEN_RE.match(token) else default
+
+
+def method_color(method: str) -> str:
+    return COLORS.get(method, COLORS["OTHER"])
 
 
 def is_static_asset(url: str) -> bool:
@@ -116,16 +159,48 @@ def is_ignored_path(url: str) -> bool:
     return any(marker in path for marker in IGNORED_PATHS)
 
 
-def is_api_request(url: str, resource_type: str = "", same_origin: bool = True) -> bool:
+def is_graphql_request(url: str, post_data=None, content_type: str = "") -> bool:
+    """True when a request is a GraphQL operation, whatever the URL looks like."""
+    if (content_type or "").lower().startswith("application/graphql"):
+        return True
+    if post_data:
+        body = post_data[:4000]
+        if GRAPHQL_JSON_KEY_RE.search(body) or GRAPHQL_RAW_START_RE.match(body):
+            return True
+    query = urlparse(url).query
+    if query:
+        params = {key.lower() for key in parse_qs(query, keep_blank_values=True)}
+        if params & GRAPHQL_URL_PARAMS:
+            return True
+    return False
+
+
+def looks_like_api_host(url: str) -> bool:
+    return bool(API_HOST_RE.match(urlparse(url).hostname or ""))
+
+
+def is_api_request(
+    url: str,
+    resource_type: str = "",
+    same_origin: bool = True,
+    post_data=None,
+    content_type: str = "",
+) -> bool:
     """Decide whether a live request should be reported as an API endpoint.
 
     Same-origin XHR/fetch traffic is always reported (no keyword guessing),
     static assets and infrastructure beacons never are, and cross-origin
     traffic still has to look like an API to avoid CDN/analytics noise.
+    GraphQL operations are recognised from their payload or content type even
+    when the URL (e.g. POST /) carries no API keyword at all.
     """
     if is_static_asset(url) or is_ignored_path(url):
         return False
     if same_origin and resource_type in ("xhr", "fetch"):
+        return True
+    if is_graphql_request(url, post_data, content_type):
+        return True
+    if resource_type in ("xhr", "fetch") and looks_like_api_host(url):
         return True
     return is_potential_api(url)
 
@@ -144,7 +219,7 @@ def extract_script_calls(text: str) -> dict:
         calls.setdefault(match.group("url"), match.group("method").upper())
     for match in XHR_OPEN_RE.finditer(text):
         method = match.group("method").upper()
-        calls.setdefault(match.group("url"), method if method in HTTP_METHODS else "GET")
+        calls.setdefault(match.group("url"), normalize_method(method))
     for match in AJAX_CALL_RE.finditer(text):
         options = match.group("opts") or ""
         url = AJAX_URL_RE.search(options)
@@ -231,14 +306,16 @@ def load_openapi_spec(spec_url, base_url, timeout=20):
         if not isinstance(operations, dict) or not isinstance(path, str):
             continue
         url = urljoin(base, path)
-        for method in operations:
-            method = method.upper()
-            if method not in HTTP_METHODS:
+        for key in operations:
+            if key.lower() not in SPEC_METHODS:
                 continue
-            endpoints.setdefault(url, set()).add(method)
+            endpoints.setdefault(url, set()).add(key.upper())
     for url in sorted(endpoints):
-        for method in sorted(endpoints[url]):
-            color = COLORS.get(method, COLORS["OTHER"])
+        for method in sorted(
+            endpoints[url],
+            key=lambda m: (METHOD_ORDER.get(m, len(METHOD_ORDER)), m),
+        ):
+            color = method_color(method)
             sys.stdout.write(f"{color}[spec] {method}: {url}{RESET}\n")
     sys.stdout.flush()
     return endpoints
@@ -305,7 +382,7 @@ async def intercept_apis(
             return False
         seen.add(key)
         apis.setdefault(url, set()).add(method)
-        color = COLORS.get(method, COLORS["OTHER"])
+        color = method_color(method)
         sys.stdout.write(f"{color}[{label}] {method}: {url}{RESET}\n")
         sys.stdout.flush()
         return True
@@ -324,9 +401,7 @@ async def intercept_apis(
         host = urlparse(absolute).netloc
         if host and host != target_host and not is_potential_api(absolute):
             return
-        if method not in HTTP_METHODS:
-            method = "GET"
-        add_endpoint(absolute, method, label="JS-detected")
+        add_endpoint(absolute, normalize_method(method), label="JS-detected")
 
     for url, methods in (extra_endpoints or {}).items():
         apis.setdefault(url, set()).update(methods)
@@ -357,10 +432,38 @@ async def intercept_apis(
         def handle_request(request):
             url = request.url
             same_origin = urlparse(url).netloc == target_host
-            if is_api_request(url, request.resource_type, same_origin):
+            try:
+                post_data = request.post_data
+            except Exception:
+                post_data = None
+            content_type = ""
+            try:
+                content_type = request.headers.get("content-type", "")
+            except Exception:
+                pass
+            if is_api_request(
+                url,
+                request.resource_type,
+                same_origin,
+                post_data=post_data,
+                content_type=content_type,
+            ):
                 add_endpoint(url, request.method.upper())
 
+        def handle_response(response):
+            try:
+                content_type = (response.headers.get("content-type", "") or "").lower()
+            except Exception:
+                return
+            if not content_type.startswith("application/graphql"):
+                return
+            url = response.url
+            if is_static_asset(url) or is_ignored_path(url):
+                return
+            add_endpoint(url, response.request.method.upper())
+
         context.on("request", handle_request)
+        context.on("response", handle_response)
         page = await context.new_page()
 
         def wait_for_user():

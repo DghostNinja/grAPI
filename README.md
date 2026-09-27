@@ -461,12 +461,28 @@ After hitting Enter:
 | --------------------- | -------------------------------------------------------------------- |
 | Live traffic          | Every same-origin `xhr`/`fetch` request                              |
 | Live traffic          | Cross-origin requests that look like an API (`/api/`, `/v1/`, `.json`, `/graphql`, ...) |
+| Live traffic          | GraphQL operations — detected from the payload (`{"query": ...}` / `query { ... }`), `application/graphql*` content type or a `?query=` URL, even when the path has no API keyword |
+| Live traffic          | XHR/fetch to API hosts such as `api.example.com`, `gql.example.com`  |
 | Page scripts          | `fetch()` / `axios.*` / `XHR.open()` / `$.ajax()` call sites (method included) |
 | Page scripts          | Any API-looking path string in inline or external JavaScript         |
 | `--spec`              | Every operation listed in the OpenAPI/Swagger document               |
 
 Static assets (fonts, images, CSS, JS, media) and infrastructure endpoints
-(`/cdn-cgi/`) are never reported.
+(`/cdn-cgi/`, PostHog telemetry paths) are never reported.
+
+**Every HTTP method is recorded** — not just GET/POST/PUT/DELETE: PATCH, HEAD,
+OPTIONS, TRACE, GraphQL's `QUERY`, WebDAV verbs like `PROPFIND`, and any other verb
+the page sends all appear in the output and in the Postman collection with their
+real method.
+
+| Method     | Colour  |
+| ---------- | ------- |
+| `GET`      | green   |
+| `POST`     | yellow  |
+| `PUT`      | blue    |
+| `PATCH`    | cyan    |
+| `DELETE`   | magenta |
+| `HEAD` / `OPTIONS` / `TRACE` | grey |
 
 ---
 
